@@ -64,6 +64,18 @@
                   class="w-full rounded-2xl border border-input bg-background px-3 py-2 text-sm"
                   placeholder="http://127.0.0.1:7890 | no_proxy=localhost,127.0.0.1"
                 />
+                <div class="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                  <span>自动刷新代理</span>
+                  <HelpTip text="每30分钟从 socks5-proxy.github.io 获取最新 SOCKS5 代理并写入账号操作代理" />
+                </div>
+                <Checkbox v-model="localSettings.basic.auto_refresh_proxy_enabled">
+                  启用自动刷新代理
+                </Checkbox>
+                <template v-if="localSettings.basic.auto_refresh_proxy_enabled">
+                  <Checkbox v-model="localSettings.basic.sync_refresh_proxy_for_chat">
+                    同步刷新聊天操作代理
+                  </Checkbox>
+                </template>
                 <div class="rounded-2xl border border-border/60 bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">
                   <p class="mb-2 font-medium">格式示例：</p>
                   <div class="space-y-1.5">
@@ -467,6 +479,8 @@ watch(settings, (value) => {
   next.basic.register_domain = typeof next.basic.register_domain === 'string'
     ? next.basic.register_domain
     : ''
+  next.basic.auto_refresh_proxy_enabled = next.basic.auto_refresh_proxy_enabled ?? false
+  next.basic.sync_refresh_proxy_for_chat = next.basic.sync_refresh_proxy_for_chat ?? false
   next.basic.duckmail_api_key = typeof next.basic.duckmail_api_key === 'string'
     ? next.basic.duckmail_api_key
     : ''

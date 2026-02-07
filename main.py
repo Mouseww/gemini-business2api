@@ -764,6 +764,169 @@ async def auto_refresh_accounts_task():
             await asyncio.sleep(60)  # 出错后等待60秒再重试
 
 
+PROXY_REFRESH_URL = "https://socks5-proxy.github.io/"
+PROXY_REFRESH_INTERVAL_SECONDS = 30 * 60
+PROXY_REFRESH_CHECK_INTERVAL_SECONDS = 60
+
+
+def _extract_latest_socks5_proxy(html: str) -> Optional[str]:
+    pattern = (
+        r"<td[^>]*class=['\"]protocol['\"][^>]*>\s*socks5\s*</td>\s*"
+        r"<td[^>]*class=['\"]ip['\"][^>]*>\s*([^<\s]+)\s*</td>\s*"
+        r"<td[^>]*class=['\"]port['\"][^>]*>\s*(\d+)\s*</td>"
+    )
+    match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    ip = match.group(1).strip()
+    port = match.group(2).strip()
+    if not ip or not port:
+        return None
+    return f"socks5://{ip}:{port}"
+
+
+async def _apply_proxy_settings(proxy_for_auth: str, proxy_for_chat: Optional[str], source: str) -> bool:
+    global PROXY_FOR_AUTH, PROXY_FOR_CHAT, http_client, http_client_chat, http_client_auth
+
+    old_proxy_for_auth = PROXY_FOR_AUTH
+    old_proxy_for_chat = PROXY_FOR_CHAT
+
+    try:
+        if not storage.is_database_enabled():
+            logger.warning("[PROXY] Database disabled, cannot persist proxy update")
+            return False
+        try:
+            settings_data = config_manager._load_yaml()
+        except Exception as exc:
+            logger.warning(f"[PROXY] load settings failed: {exc}")
+            return False
+
+        if not isinstance(settings_data, dict):
+            logger.warning("[PROXY] load settings returned invalid data")
+            return False
+
+        basic = dict(settings_data.get("basic") or {})
+        basic["proxy_for_auth"] = proxy_for_auth
+        if proxy_for_chat is not None:
+            basic["proxy_for_chat"] = proxy_for_chat
+        settings_data["basic"] = basic
+
+        config_manager.save_yaml(settings_data)
+        config_manager.reload()
+
+        _proxy_auth, _no_proxy_auth = parse_proxy_setting(config.basic.proxy_for_auth)
+        _proxy_chat, _no_proxy_chat = parse_proxy_setting(config.basic.proxy_for_chat)
+        PROXY_FOR_AUTH = _proxy_auth
+        PROXY_FOR_CHAT = _proxy_chat
+        _NO_PROXY = ",".join(filter(None, {_no_proxy_auth, _no_proxy_chat}))
+        if _NO_PROXY:
+            os.environ["NO_PROXY"] = _NO_PROXY
+        else:
+            os.environ.pop("NO_PROXY", None)
+
+        if old_proxy_for_auth != PROXY_FOR_AUTH or old_proxy_for_chat != PROXY_FOR_CHAT:
+            await http_client.aclose()
+            await http_client_chat.aclose()
+            await http_client_auth.aclose()
+
+            http_client = httpx.AsyncClient(
+                proxy=(PROXY_FOR_CHAT or None),
+                verify=False,
+                http2=False,
+                timeout=httpx.Timeout(TIMEOUT_SECONDS, connect=60.0),
+                limits=httpx.Limits(
+                    max_keepalive_connections=100,
+                    max_connections=200
+                )
+            )
+
+            http_client_chat = httpx.AsyncClient(
+                proxy=(PROXY_FOR_CHAT or None),
+                verify=False,
+                http2=False,
+                timeout=httpx.Timeout(TIMEOUT_SECONDS, connect=60.0),
+                limits=httpx.Limits(
+                    max_keepalive_connections=100,
+                    max_connections=200
+                )
+            )
+
+            http_client_auth = httpx.AsyncClient(
+                proxy=(PROXY_FOR_AUTH or None),
+                verify=False,
+                http2=False,
+                timeout=httpx.Timeout(TIMEOUT_SECONDS, connect=60.0),
+                limits=httpx.Limits(
+                    max_keepalive_connections=100,
+                    max_connections=200
+                )
+            )
+
+            logger.info(f"[PROXY] Account operations (register/login/refresh): {PROXY_FOR_AUTH if PROXY_FOR_AUTH else 'disabled'}")
+            logger.info(f"[PROXY] Chat operations (JWT/session/messages): {PROXY_FOR_CHAT if PROXY_FOR_CHAT else 'disabled'}")
+
+            multi_account_mgr.update_http_client(http_client)
+
+            if register_service:
+                register_service.http_client = http_client_auth
+            if login_service:
+                login_service.http_client = http_client_auth
+
+        logger.info(f"[PROXY] Auto refresh applied ({source})")
+        return True
+    except Exception as exc:
+        logger.error(f"[PROXY] Auto refresh failed: {type(exc).__name__}: {str(exc)[:120]}")
+        return False
+
+
+async def auto_refresh_proxy_task() -> None:
+    """定时从 socks5-proxy.github.io 获取最新 SOCKS5 代理并更新配置"""
+    while True:
+        try:
+            if not storage.is_database_enabled():
+                await asyncio.sleep(PROXY_REFRESH_CHECK_INTERVAL_SECONDS)
+                continue
+            if not config.basic.auto_refresh_proxy_enabled:
+                await asyncio.sleep(PROXY_REFRESH_CHECK_INTERVAL_SECONDS)
+                continue
+
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=10.0)) as client:
+                response = await client.get(
+                    PROXY_REFRESH_URL,
+                    headers={"User-Agent": USER_AGENT}
+                )
+
+            if response.status_code != 200:
+                logger.warning(f"[PROXY] Fetch failed: status={response.status_code}")
+                await asyncio.sleep(PROXY_REFRESH_INTERVAL_SECONDS)
+                continue
+
+            proxy_value = _extract_latest_socks5_proxy(response.text)
+            if not proxy_value:
+                logger.warning("[PROXY] No socks5 proxy found in source page")
+                await asyncio.sleep(PROXY_REFRESH_INTERVAL_SECONDS)
+                continue
+
+            needs_update = proxy_value != config.basic.proxy_for_auth
+            if config.basic.sync_refresh_proxy_for_chat:
+                needs_update = needs_update or (proxy_value != config.basic.proxy_for_chat)
+
+            if not needs_update:
+                await asyncio.sleep(PROXY_REFRESH_INTERVAL_SECONDS)
+                continue
+
+            proxy_for_chat = proxy_value if config.basic.sync_refresh_proxy_for_chat else None
+            await _apply_proxy_settings(proxy_value, proxy_for_chat, "socks5-proxy")
+
+            await asyncio.sleep(PROXY_REFRESH_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            logger.info("[PROXY] Auto refresh task stopped")
+            break
+        except Exception as exc:
+            logger.error(f"[PROXY] Auto refresh task error: {type(exc).__name__}: {str(exc)[:120]}")
+            await asyncio.sleep(60)
+
+
 @app.on_event("startup")
 async def startup_event():
     """应用启动时初始化后台任务"""
@@ -814,6 +977,13 @@ async def startup_event():
             logger.error(f"[SYSTEM] 启动登录服务失败: {e}")
     else:
         logger.info("[SYSTEM] 自动登录刷新未启用或依赖不可用")
+
+    # 启动自动刷新代理任务（始终启动，但默认禁用）
+    try:
+        asyncio.create_task(auto_refresh_proxy_task())
+        logger.info("[SYSTEM] 代理自动刷新任务已启动（默认禁用，可在设置中启用）")
+    except Exception as e:
+        logger.error(f"[SYSTEM] 启动代理自动刷新任务失败: {e}")
 
     # 启动冷却状态定期保存任务（每5分钟保存一次）
     if storage.is_database_enabled():
@@ -1443,6 +1613,8 @@ async def admin_get_settings(request: Request):
             "base_url": config.basic.base_url,
             "proxy_for_auth": config.basic.proxy_for_auth,
             "proxy_for_chat": config.basic.proxy_for_chat,
+            "auto_refresh_proxy_enabled": config.basic.auto_refresh_proxy_enabled,
+            "sync_refresh_proxy_for_chat": config.basic.sync_refresh_proxy_for_chat,
             "duckmail_base_url": config.basic.duckmail_base_url,
             "duckmail_api_key": config.basic.duckmail_api_key,
             "duckmail_verify_ssl": config.basic.duckmail_verify_ssl,
@@ -1507,6 +1679,8 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
         basic.setdefault("duckmail_base_url", config.basic.duckmail_base_url)
         basic.setdefault("duckmail_api_key", config.basic.duckmail_api_key)
         basic.setdefault("duckmail_verify_ssl", config.basic.duckmail_verify_ssl)
+        basic.setdefault("auto_refresh_proxy_enabled", config.basic.auto_refresh_proxy_enabled)
+        basic.setdefault("sync_refresh_proxy_for_chat", config.basic.sync_refresh_proxy_for_chat)
         basic.setdefault("temp_mail_provider", config.basic.temp_mail_provider)
         basic.setdefault("moemail_base_url", config.basic.moemail_base_url)
         basic.setdefault("moemail_api_key", config.basic.moemail_api_key)

@@ -48,6 +48,8 @@ class BasicConfig(BaseModel):
     base_url: str = Field(default="", description="服务器URL（留空则自动检测）")
     proxy_for_auth: str = Field(default="", description="账户操作代理地址（注册/登录/刷新，留空则不使用代理）")
     proxy_for_chat: str = Field(default="", description="对话操作代理地址（JWT/会话/消息，留空则不使用代理）")
+    auto_refresh_proxy_enabled: bool = Field(default=False, description="是否启用自动刷新代理")
+    sync_refresh_proxy_for_chat: bool = Field(default=False, description="是否同步刷新聊天操作代理")
     duckmail_base_url: str = Field(default="https://api.duckmail.sbs", description="DuckMail API地址")
     duckmail_api_key: str = Field(default="", description="DuckMail API key")
     duckmail_verify_ssl: bool = Field(default=True, description="DuckMail SSL校验")
@@ -199,6 +201,8 @@ class ConfigManager:
             base_url=basic_data.get("base_url") or "",
             proxy_for_auth=str(proxy_for_auth or "").strip(),
             proxy_for_chat=str(proxy_for_chat or "").strip(),
+            auto_refresh_proxy_enabled=_parse_bool(basic_data.get("auto_refresh_proxy_enabled"), False),
+            sync_refresh_proxy_for_chat=_parse_bool(basic_data.get("sync_refresh_proxy_for_chat"), False),
             duckmail_base_url=basic_data.get("duckmail_base_url") or "https://api.duckmail.sbs",
             duckmail_api_key=str(duckmail_api_key_raw or "").strip(),
             duckmail_verify_ssl=_parse_bool(basic_data.get("duckmail_verify_ssl"), True),

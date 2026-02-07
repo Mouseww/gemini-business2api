@@ -76,6 +76,8 @@ export interface Settings {
     base_url?: string
     proxy_for_auth?: string
     proxy_for_chat?: string
+    auto_refresh_proxy_enabled?: boolean
+    sync_refresh_proxy_for_chat?: boolean
     duckmail_base_url?: string
     duckmail_api_key?: string
     duckmail_verify_ssl?: boolean
