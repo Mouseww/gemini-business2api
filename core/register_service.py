@@ -44,6 +44,7 @@ class RegisterService(BaseTaskService[RegisterTask]):
         session_cache_ttl_seconds: int,
         global_stats_provider: Callable[[], dict],
         set_multi_account_mgr: Optional[Callable[[Any], None]] = None,
+        proxy_rotate_cb: Optional[Callable[[str], Any]] = None,
     ) -> None:
         super().__init__(
             multi_account_mgr,
@@ -55,6 +56,8 @@ class RegisterService(BaseTaskService[RegisterTask]):
             set_multi_account_mgr,
             log_prefix="REGISTER",
         )
+        self._proxy_rotate_cb = proxy_rotate_cb
+        self._consecutive_code_failures = 0
 
     def _get_running_task(self) -> Optional[RegisterTask]:
         """获取正在运行或等待中的任务"""
@@ -153,10 +156,12 @@ class RegisterService(BaseTaskService[RegisterTask]):
                 task.success_count += 1
                 email = result.get('email', '未知')
                 self._append_log(task, "info", f"✅ 注册成功: {email}")
+                self._consecutive_code_failures = 0
             else:
                 task.fail_count += 1
                 error = result.get('error', '未知错误')
                 self._append_log(task, "error", f"❌ 注册失败: {error}")
+                await self._maybe_rotate_auth_proxy(error)
 
         if task.cancel_requested:
             task.status = TaskStatus.CANCELLED
@@ -165,6 +170,31 @@ class RegisterService(BaseTaskService[RegisterTask]):
         task.finished_at = time.time()
         self._current_task_id = None
         self._append_log(task, "info", f"🏁 注册任务完成 (成功: {task.success_count}, 失败: {task.fail_count}, 总计: {task.count})")
+
+    def _is_verification_code_error(self, error: str) -> bool:
+        if not error:
+            return False
+        lowered = error.lower()
+        return "verification code" in lowered or "验证码" in error
+
+    async def _maybe_rotate_auth_proxy(self, error: str) -> None:
+        if not self._is_verification_code_error(error):
+            self._consecutive_code_failures = 0
+            return
+
+        self._consecutive_code_failures += 1
+        if self._consecutive_code_failures < 2:
+            return
+
+        if not config.basic.auto_refresh_proxy_enabled:
+            return
+
+        if self._proxy_rotate_cb:
+            try:
+                await self._proxy_rotate_cb(f"verification code failures x{self._consecutive_code_failures}")
+                self._consecutive_code_failures = 0
+            except Exception as exc:
+                logger.warning("[REGISTER] auto rotate proxy failed: %s", exc)
 
     def _register_one(self, domain: Optional[str], mail_provider: Optional[str], task: RegisterTask) -> dict:
         """注册单个账户"""

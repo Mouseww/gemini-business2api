@@ -523,6 +523,13 @@ def _set_multi_account_mgr(new_mgr):
 def _get_global_stats():
     return global_stats
 
+
+async def _rotate_auth_proxy_on_code_failure(reason: str) -> bool:
+    rotate = globals().get("_refresh_proxy_to_next")
+    if rotate:
+        return await rotate("auth", reason)
+    return False
+
 try:
     from core.register_service import RegisterService
     from core.login_service import LoginService
@@ -534,6 +541,7 @@ try:
         SESSION_CACHE_TTL_SECONDS,
         _get_global_stats,
         _set_multi_account_mgr,
+        proxy_rotate_cb=_rotate_auth_proxy_on_code_failure,
     )
     login_service = LoginService(
         multi_account_mgr,
@@ -543,6 +551,7 @@ try:
         SESSION_CACHE_TTL_SECONDS,
         _get_global_stats,
         _set_multi_account_mgr,
+        proxy_rotate_cb=_rotate_auth_proxy_on_code_failure,
     )
 except Exception as e:
     logger.warning("[SYSTEM] 自动注册/刷新服务不可用: %s", e)
@@ -768,21 +777,96 @@ PROXY_REFRESH_URL = "https://socks5-proxy.github.io/"
 PROXY_REFRESH_INTERVAL_SECONDS = 30 * 60
 PROXY_REFRESH_CHECK_INTERVAL_SECONDS = 60
 
+_chat_proxy_rotate_lock = asyncio.Lock()
+_chat_consecutive_failures = 0
 
-def _extract_latest_socks5_proxy(html: str) -> Optional[str]:
+
+def _extract_socks5_proxy_list(html: str) -> List[str]:
     pattern = (
         r"<td[^>]*class=['\"]protocol['\"][^>]*>\s*socks5\s*</td>\s*"
         r"<td[^>]*class=['\"]ip['\"][^>]*>\s*([^<\s]+)\s*</td>\s*"
         r"<td[^>]*class=['\"]port['\"][^>]*>\s*(\d+)\s*</td>"
     )
-    match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
-    if not match:
+    proxies: List[str] = []
+    for match in re.finditer(pattern, html, re.IGNORECASE | re.DOTALL):
+        ip = match.group(1).strip()
+        port = match.group(2).strip()
+        if ip and port:
+            proxies.append(f"socks5://{ip}:{port}")
+    return proxies
+
+
+def _select_next_proxy(current: str, proxy_list: List[str]) -> Optional[str]:
+    if not proxy_list:
         return None
-    ip = match.group(1).strip()
-    port = match.group(2).strip()
-    if not ip or not port:
-        return None
-    return f"socks5://{ip}:{port}"
+    if current in proxy_list:
+        idx = proxy_list.index(current)
+        return proxy_list[(idx + 1) % len(proxy_list)]
+    return proxy_list[0]
+
+
+def _extract_latest_socks5_proxy(html: str) -> Optional[str]:
+    proxy_list = _extract_socks5_proxy_list(html)
+    return proxy_list[0] if proxy_list else None
+
+
+async def _fetch_socks5_proxy_list() -> List[str]:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=10.0)) as client:
+        response = await client.get(
+            PROXY_REFRESH_URL,
+            headers={"User-Agent": USER_AGENT}
+        )
+    if response.status_code != 200:
+        raise HTTPException(502, f"获取代理失败: status={response.status_code}")
+    return _extract_socks5_proxy_list(response.text)
+
+
+async def _refresh_proxy_to_next(target: str, reason: str) -> bool:
+    if not config.basic.auto_refresh_proxy_enabled:
+        return False
+    proxy_list = await _fetch_socks5_proxy_list()
+    if not proxy_list:
+        return False
+
+    current_auth, _ = parse_proxy_setting(config.basic.proxy_for_auth)
+    current_chat, _ = parse_proxy_setting(config.basic.proxy_for_chat)
+
+    if target == "auth":
+        next_proxy = _select_next_proxy(current_auth, proxy_list)
+        if not next_proxy:
+            return False
+        logger.warning(f"[PROXY] rotate auth proxy: {current_auth or 'none'} -> {next_proxy} ({reason})")
+        return await _apply_proxy_settings(next_proxy, current_chat or None, reason)
+
+    if target == "chat":
+        next_proxy = _select_next_proxy(current_chat, proxy_list)
+        if not next_proxy:
+            return False
+        logger.warning(f"[PROXY] rotate chat proxy: {current_chat or 'none'} -> {next_proxy} ({reason})")
+        return await _apply_proxy_settings(current_auth or "", next_proxy, reason)
+
+    return False
+
+
+async def _record_chat_result_and_rotate_if_needed(status: str, error_detail: Optional[str] = None) -> None:
+    global _chat_consecutive_failures
+    if status == "success":
+        _chat_consecutive_failures = 0
+        return
+
+    _chat_consecutive_failures += 1
+    if _chat_consecutive_failures < 2:
+        return
+
+    if not config.basic.auto_refresh_proxy_enabled:
+        return
+
+    async with _chat_proxy_rotate_lock:
+        if _chat_consecutive_failures < 2:
+            return
+        reason = f"chat failure x{_chat_consecutive_failures}: {error_detail or 'unknown'}"
+        await _refresh_proxy_to_next("chat", reason)
+        _chat_consecutive_failures = 0
 
 
 async def _apply_proxy_settings(proxy_for_auth: str, proxy_for_chat: Optional[str], source: str) -> bool:
@@ -890,18 +974,14 @@ async def auto_refresh_proxy_task() -> None:
                 await asyncio.sleep(PROXY_REFRESH_CHECK_INTERVAL_SECONDS)
                 continue
 
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=10.0)) as client:
-                response = await client.get(
-                    PROXY_REFRESH_URL,
-                    headers={"User-Agent": USER_AGENT}
-                )
-
-            if response.status_code != 200:
-                logger.warning(f"[PROXY] Fetch failed: status={response.status_code}")
+            try:
+                proxy_list = await _fetch_socks5_proxy_list()
+            except HTTPException as exc:
+                logger.warning(f"[PROXY] Fetch failed: {exc.detail if hasattr(exc, 'detail') else exc}")
                 await asyncio.sleep(PROXY_REFRESH_INTERVAL_SECONDS)
                 continue
 
-            proxy_value = _extract_latest_socks5_proxy(response.text)
+            proxy_value = proxy_list[0] if proxy_list else None
             if not proxy_value:
                 logger.warning("[PROXY] No socks5 proxy found in source page")
                 await asyncio.sleep(PROXY_REFRESH_INTERVAL_SECONDS)
@@ -1843,6 +1923,30 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
         logger.error(f"[CONFIG] 更新设置失败: {str(e)}")
         raise HTTPException(500, f"更新失败: {str(e)}")
 
+
+@app.post("/admin/settings/refresh-proxy")
+@require_login()
+async def admin_refresh_proxy_now(request: Request):
+    """立即刷新 SOCKS5 代理并应用到设置"""
+    if not storage.is_database_enabled():
+        raise HTTPException(400, "数据库未启用，无法保存代理配置")
+
+    proxy_list = await _fetch_socks5_proxy_list()
+    proxy_value = proxy_list[0] if proxy_list else None
+    if not proxy_value:
+        raise HTTPException(502, "未解析到 SOCKS5 代理")
+
+    proxy_for_chat = proxy_value if config.basic.sync_refresh_proxy_for_chat else None
+    updated = await _apply_proxy_settings(proxy_value, proxy_for_chat, "manual")
+    if not updated:
+        raise HTTPException(500, "代理应用失败")
+
+    return {
+        "proxy_for_auth": config.basic.proxy_for_auth,
+        "proxy_for_chat": config.basic.proxy_for_chat,
+        "sync_refresh_proxy_for_chat": config.basic.sync_refresh_proxy_for_chat,
+    }
+
 @app.get("/admin/log")
 @require_login()
 async def admin_get_logs(
@@ -2101,6 +2205,8 @@ async def chat_impl(
             global_stats["recent_conversations"].append(entry)
             global_stats["recent_conversations"] = global_stats["recent_conversations"][-60:]
             await save_stats(global_stats)
+
+        await _record_chat_result_and_rotate_if_needed(status, error_detail)
 
     def classify_error_status(status_code: Optional[int], error: Exception) -> str:
         if status_code == 504:

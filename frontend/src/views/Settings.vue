@@ -68,9 +68,18 @@
                   <span>自动刷新代理</span>
                   <HelpTip text="每30分钟从 socks5-proxy.github.io 获取最新 SOCKS5 代理并写入账号操作代理" />
                 </div>
-                <Checkbox v-model="localSettings.basic.auto_refresh_proxy_enabled">
-                  启用自动刷新代理
-                </Checkbox>
+                <div class="flex items-center justify-between gap-3">
+                  <Checkbox v-model="localSettings.basic.auto_refresh_proxy_enabled">
+                    启用自动刷新代理
+                  </Checkbox>
+                  <button
+                    class="rounded-full border border-border px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                    :disabled="isSaving || !localSettings"
+                    @click="handleRefreshProxy"
+                  >
+                    立即刷新
+                  </button>
+                </div>
                 <template v-if="localSettings.basic.auto_refresh_proxy_enabled">
                   <Checkbox v-model="localSettings.basic.sync_refresh_proxy_for_chat">
                     同步刷新聊天操作代理
@@ -375,6 +384,7 @@ import { storeToRefs } from 'pinia'
 import { useSettingsStore } from '@/stores/settings'
 import { useToast } from '@/composables/useToast'
 import { defaultMailProvider, mailProviderOptions } from '@/constants/mailProviders'
+import { settingsApi } from '@/api'
 import SelectMenu from '@/components/ui/SelectMenu.vue'
 import Checkbox from '@/components/ui/Checkbox.vue'
 import HelpTip from '@/components/ui/HelpTip.vue'
@@ -531,6 +541,27 @@ const handleSave = async () => {
   } catch (error: any) {
     errorMessage.value = error.message || '保存失败'
     toast.error(error.message || '保存失败')
+  } finally {
+    isSaving.value = false
+  }
+}
+
+const handleRefreshProxy = async () => {
+  if (!localSettings.value) return
+  errorMessage.value = ''
+  isSaving.value = true
+
+  try {
+    const data = await settingsApi.refreshProxy()
+    if (localSettings.value?.basic) {
+      localSettings.value.basic.proxy_for_auth = data.proxy_for_auth || ''
+      localSettings.value.basic.proxy_for_chat = data.proxy_for_chat || ''
+      localSettings.value.basic.sync_refresh_proxy_for_chat = data.sync_refresh_proxy_for_chat ?? false
+    }
+    toast.success('代理已刷新')
+  } catch (error: any) {
+    errorMessage.value = error.message || '刷新失败'
+    toast.error(error.message || '刷新失败')
   } finally {
     isSaving.value = false
   }

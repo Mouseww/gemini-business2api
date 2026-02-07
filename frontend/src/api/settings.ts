@@ -9,4 +9,8 @@ export const settingsApi = {
   // 更新设置
   update: (settings: Settings) =>
     apiClient.put('/admin/settings', settings),
+
+  // 立即刷新 SOCKS5 代理
+  refreshProxy: () =>
+    apiClient.post('/admin/settings/refresh-proxy'),
 }
