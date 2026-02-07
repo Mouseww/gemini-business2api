@@ -149,7 +149,20 @@ class LoginService(BaseTaskService[LoginTask]):
             task.progress += 1
             task.results.append(result)
 
-            if result.get("success"):
+            final_result = result
+            if not result.get("success"):
+                error = result.get('error', '未知错误')
+                rotated = await self._maybe_rotate_auth_proxy(error)
+                if rotated:
+                    self._append_log(task, "warning", f"🔁 已切换代理，尝试重新刷新: {account_id}")
+                    try:
+                        final_result = await loop.run_in_executor(self._executor, self._refresh_one, account_id, task)
+                    except Exception as exc:
+                        final_result = {"success": False, "email": account_id, "error": str(exc)}
+                    if not final_result.get("success") and self._is_verification_code_error(final_result.get("error", "")):
+                        self._consecutive_code_failures = 1
+
+            if final_result.get("success"):
                 task.success_count += 1
                 self._append_log(task, "info", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
                 self._append_log(task, "info", f"🎉 刷新成功: {account_id}")
@@ -157,12 +170,11 @@ class LoginService(BaseTaskService[LoginTask]):
                 self._consecutive_code_failures = 0
             else:
                 task.fail_count += 1
-                error = result.get('error', '未知错误')
+                error = final_result.get('error', '未知错误')
                 self._append_log(task, "error", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
                 self._append_log(task, "error", f"❌ 刷新失败: {account_id}")
                 self._append_log(task, "error", f"❌ 失败原因: {error}")
                 self._append_log(task, "error", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-                await self._maybe_rotate_auth_proxy(error)
 
         if task.cancel_requested:
             task.status = TaskStatus.CANCELLED
@@ -179,24 +191,28 @@ class LoginService(BaseTaskService[LoginTask]):
         lowered = error.lower()
         return "verification code" in lowered or "验证码" in error
 
-    async def _maybe_rotate_auth_proxy(self, error: str) -> None:
+    async def _maybe_rotate_auth_proxy(self, error: str) -> bool:
         if not self._is_verification_code_error(error):
             self._consecutive_code_failures = 0
-            return
+            return False
 
         self._consecutive_code_failures += 1
         if self._consecutive_code_failures < 2:
-            return
+            return False
 
         if not config.basic.auto_refresh_proxy_enabled:
-            return
+            return False
 
         if self._proxy_rotate_cb:
             try:
                 await self._proxy_rotate_cb(f"verification code failures x{self._consecutive_code_failures}")
                 self._consecutive_code_failures = 0
+                return True
             except Exception as exc:
                 logger.warning("[LOGIN] auto rotate proxy failed: %s", exc)
+                return False
+
+        return False
 
     def _refresh_one(self, account_id: str, task: LoginTask) -> dict:
         """刷新单个账户"""
